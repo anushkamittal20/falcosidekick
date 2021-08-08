@@ -384,6 +384,7 @@ type PolicyReportConfig struct {
 	Kubeconfig      string
 	MinimumPriority string
 	Warning         int
+	MaxReports      int
 }
 
 // RabbitmqConfig represents parameters for rabbitmq
