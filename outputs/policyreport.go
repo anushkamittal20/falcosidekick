@@ -7,48 +7,54 @@ import (
 
 	"github.com/DataDog/datadog-go/statsd"
 	"github.com/falcosecurity/falcosidekick/types"
-	"github.com/kubernetes-sigs/wg-policy-prototypes/policy-report/kube-bench-adapter/pkg/apis/wgpolicyk8s.io/v1alpha2"
-	clusterpolicyreport "github.com/kubernetes-sigs/wg-policy-prototypes/policy-report/kube-bench-adapter/pkg/apis/wgpolicyk8s.io/v1alpha2"
-	policyreport "github.com/kubernetes-sigs/wg-policy-prototypes/policy-report/kube-bench-adapter/pkg/apis/wgpolicyk8s.io/v1alpha2"
+	"github.com/google/uuid"
+	wgpolicy "github.com/kubernetes-sigs/wg-policy-prototypes/policy-report/kube-bench-adapter/pkg/apis/wgpolicyk8s.io/v1alpha2"
 	crdClient "github.com/kubernetes-sigs/wg-policy-prototypes/policy-report/kube-bench-adapter/pkg/generated/v1alpha2/clientset/versioned"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/retry"
 )
 
-var polreport *policyreport.PolicyReport = &policyreport.PolicyReport{
+const (
+	policyReportBaseName        = "falco-policy-report-"
+	clusterPolicyReportBaseName = "falco-cluster-policy-report-"
+	policyReportSource          = "Falco"
+)
+
+var policyReport *wgpolicy.PolicyReport = &wgpolicy.PolicyReport{
 	ObjectMeta: metav1.ObjectMeta{
-		Name: "dummy-policy-report",
+		Name: policyReportBaseName,
 	},
-	Summary: v1alpha2.PolicyReportSummary{
+	Summary: wgpolicy.PolicyReportSummary{
 		Fail: 0,
 		Warn: 0, //to-do
 	},
 }
-var report *clusterpolicyreport.ClusterPolicyReport = &clusterpolicyreport.ClusterPolicyReport{
+var clusterPolicyReport *wgpolicy.ClusterPolicyReport = &wgpolicy.ClusterPolicyReport{
 	ObjectMeta: metav1.ObjectMeta{
-		Name: "dummy-cluster-policy-report",
+		Name: clusterPolicyReportBaseName,
 	},
-	Summary: v1alpha2.PolicyReportSummary{
+	Summary: wgpolicy.PolicyReportSummary{
 		Fail: 0,
 		Warn: 0, //to-do
 	},
 }
 
 //in accordance with PolicyReport CRD
-var failbound int
-var repcount int = 0
-var polrepcount int = 0
+var (
+	failbound   int
+	repcount    int
+	polrepcount int
+)
 
 func NewPolicyReportClient(config *types.Configuration, stats *types.Statistics, promStats *types.PromStatistics, statsdClient, dogstatsdClient *statsd.Client) (*Client, error) {
 	restConfig, err := rest.InClusterConfig()
 	if err != nil {
 		restConfig, err = clientcmd.BuildConfigFromFlags("", config.PolicyReport.Kubeconfig)
 		if err != nil {
-			fmt.Printf("[ERROR] :unable to load kube config file: %v", err)
+			fmt.Printf("[ERROR] : Unable to load kube config file: %v", err)
 		}
 	}
 	clientset, err := kubernetes.NewForConfig(restConfig)
@@ -59,6 +65,12 @@ func NewPolicyReportClient(config *types.Configuration, stats *types.Statistics,
 	if err != nil {
 		return nil, err
 	}
+
+	policyReport.ObjectMeta.Name += uuid.NewString()
+	clusterPolicyReport.ObjectMeta.Name += uuid.NewString()
+
+	failbound = config.PolicyReport.FailThreshold
+
 	return &Client{
 		OutputType:       "PolicyReport",
 		Config:           config,
@@ -71,149 +83,156 @@ func NewPolicyReportClient(config *types.Configuration, stats *types.Statistics,
 	}, nil
 }
 
-// PolicyReportPost creates Policy Report Resource in Kubernetes
-func (c *Client) PolicyReportCreate(falcopayload types.FalcoPayload) {
-	failbound = c.Config.PolicyReport.FailThreshold
+// CreateReport creates Policy Report or Cluster Policy Report in Kubernetes
+func (c *Client) CreateReport(falcopayload types.FalcoPayload) {
 	r, namespaceScoped := newResult(falcopayload)
-	if namespaceScoped == true {
-		//policyreport to be created
-		policyr := c.Crdclient.Wgpolicyk8sV1alpha2().PolicyReports("default")
-		polrepcount++
-		if polrepcount > c.Config.PolicyReport.MaxEvents {
-			//To do for pruning
-			checklowvalue := checklow(report.Results)
-			if checklowvalue > 0 {
-				polreport.Results[checklowvalue] = polreport.Results[0]
-			}
-			polreport.Results[0] = nil
-			polreport.Results = polreport.Results[1:]
-			polrepcount = polrepcount - 1
-		}
-		polreport.Results = append(report.Results, r)
-		_, getErr := policyr.Get(context.Background(), polreport.Name, metav1.GetOptions{})
-		if errors.IsNotFound(getErr) {
-			result, err := policyr.Create(context.TODO(), polreport, metav1.CreateOptions{})
-			if err != nil {
-				log.Printf("[ERROR] : %v\n", err)
-			}
-			fmt.Printf("[INFO] :Created policy-report %q.\n", result.GetObjectMeta().GetName())
-		} else {
-			// Update existing Policy Report
-			retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				result, err := policyr.Get(context.Background(), polreport.GetName(), metav1.GetOptions{})
-				if errors.IsNotFound(err) {
-					// This doesnt ever happen even if it is already deleted or not found
-					log.Printf("[ERROR] :%v not found", polreport.GetName())
-					return nil
-				}
-				if err != nil {
-					return err
-				}
-				polreport.SetResourceVersion(result.GetResourceVersion())
-				_, updateErr := policyr.Update(context.Background(), polreport, metav1.UpdateOptions{})
-				return updateErr
-			})
-			if retryErr != nil {
-				fmt.Printf("[ERROR] :update failed: %v", retryErr)
-			}
-			fmt.Println("[INFO] :updated policy report...")
+
+	if namespaceScoped != "" {
+		policyReport.Results = append(policyReport.Results, r)
+		updateOrCreatePolicyReport(c, namespaceScoped)
+		if len(policyReport.Results) >= failbound {
+			policyReport.ObjectMeta.Name = policyReportBaseName + uuid.NewString()
 		}
 	} else {
-		//clusterpolicyreport to be created
-		clusterpr := c.Crdclient.Wgpolicyk8sV1alpha2().ClusterPolicyReports()
-		repcount++
-		if repcount > c.Config.PolicyReport.MaxEvents {
-			//To do for pruning
-			checklowvalue := checklow(report.Results)
-			if checklowvalue > 0 {
-				report.Results[checklowvalue] = report.Results[0]
-			}
-			report.Results[0] = nil
-			report.Results = report.Results[1:]
-			repcount = repcount - 1
+		updateOrCreatePolicyReport(c, namespaceScoped)
+		if len(clusterPolicyReport.Results) >= failbound {
+			clusterPolicyReport.ObjectMeta.Name = clusterPolicyReportBaseName + uuid.NewString()
 		}
-		report.Results = append(report.Results, r)
-		_, getErr := clusterpr.Get(context.Background(), report.Name, metav1.GetOptions{})
-		if errors.IsNotFound(getErr) {
-			result, err := clusterpr.Create(context.TODO(), report, metav1.CreateOptions{})
-			if err != nil {
-				log.Printf("[ERROR] : %v\n", err)
-			}
-			fmt.Printf("[INFO] :Created cluster-policy-report %q.\n", result.GetObjectMeta().GetName())
-		} else {
-			// Update existing Policy Report
-			retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				result, err := clusterpr.Get(context.Background(), report.GetName(), metav1.GetOptions{})
-				if errors.IsNotFound(err) {
-					// This doesnt ever happen even if it is already deleted or not found
-					log.Printf("[ERROR] :%v not found", report.GetName())
-					return nil
-				}
-				if err != nil {
-					return err
-				}
-				report.SetResourceVersion(result.GetResourceVersion())
-				_, updateErr := clusterpr.Update(context.Background(), report, metav1.UpdateOptions{})
-				return updateErr
-			})
-			if retryErr != nil {
-				fmt.Printf("[ERROR] :update failed: %v", retryErr)
-			}
-			fmt.Println("[INFO] :updated cluster policy report...")
-		}
-
 	}
+}
+
+func isPolicyReportExist(c *Client, namespace string) bool {
+	_, err := getPolicyReport(c, namespace)
+	if !errors.IsNotFound(err) {
+		log.Printf("[Info]  : Policy Report %v doesn't exist\n", policyReport.Name)
+		return false
+	}
+	return true
+}
+
+func getPolicyReport(c *Client, namespace string) (*wgpolicy.PolicyReport, error) {
+	policyr := c.Crdclient.Wgpolicyk8sV1alpha2().PolicyReports(namespace)
+	return policyr.Get(context.Background(), policyReport.Name, metav1.GetOptions{})
+}
+
+func createPolicyReport(c *Client, namespace string) {
+	policyr := c.Crdclient.Wgpolicyk8sV1alpha2().PolicyReports(namespace)
+	result, err := policyr.Create(context.TODO(), policyReport, metav1.CreateOptions{})
+	if err != nil {
+		log.Printf("[ERROR] : %v\n", err)
+	}
+	log.Printf("[INFO]  : Create policy report %q.\n", result.GetObjectMeta().GetName())
+}
+
+func updatePolicyReport(c *Client, namespace string) {
+	policyr := c.Crdclient.Wgpolicyk8sV1alpha2().PolicyReports(namespace)
+	existingReport, _ := getPolicyReport(c, namespace)
+	policyReport.SetResourceVersion(existingReport.GetResourceVersion())
+	result, err := policyr.Update(context.Background(), policyReport, metav1.UpdateOptions{})
+	if err != nil {
+		log.Printf("[ERROR] : %v\n", err)
+	}
+	log.Printf("[INFO]  : Update policy report %q.\n", result.GetObjectMeta().GetName())
+}
+
+func updateOrCreatePolicyReport(c *Client, namespace string) {
+	if isPolicyReportExist(c, namespace) {
+		updatePolicyReport(c, namespace)
+		return
+	}
+	createPolicyReport(c, namespace)
+}
+
+func isClusterPolicyReportExist(c *Client) bool {
+	_, err := getClusterPolicyReport(c)
+	if !errors.IsNotFound(err) {
+		log.Printf("[Info]  : Policy Report %v doesn't exist\n", clusterPolicyReport.Name)
+		return false
+	}
+	return true
+}
+
+func getClusterPolicyReport(c *Client) (*wgpolicy.ClusterPolicyReport, error) {
+	policyr := c.Crdclient.Wgpolicyk8sV1alpha2().ClusterPolicyReports()
+	return policyr.Get(context.Background(), clusterPolicyReport.Name, metav1.GetOptions{})
+}
+
+func createClusterPolicyReport(c *Client) {
+	policyr := c.Crdclient.Wgpolicyk8sV1alpha2().ClusterPolicyReports()
+	result, err := policyr.Create(context.TODO(), clusterPolicyReport, metav1.CreateOptions{})
+	if err != nil {
+		log.Printf("[ERROR] : %v\n", err)
+	}
+	log.Printf("[INFO]  : Create cluster policy report %q.\n", result.GetObjectMeta().GetName())
+}
+
+func updateClusterPolicyReport(c *Client) {
+	policyr := c.Crdclient.Wgpolicyk8sV1alpha2().ClusterPolicyReports()
+	existingReport, _ := getClusterPolicyReport(c)
+	clusterPolicyReport.SetResourceVersion(existingReport.GetResourceVersion())
+	result, err := policyr.Update(context.Background(), clusterPolicyReport, metav1.UpdateOptions{})
+	if err != nil {
+		log.Printf("[ERROR] : %v\n", err)
+	}
+	log.Printf("[INFO]  : Update cluster policy report %q.\n", result.GetObjectMeta().GetName())
+}
+
+func updateOrCreateClusterPolicyReport(c *Client) {
+	if isClusterPolicyReportExist(c) {
+		updateClusterPolicyReport(c)
+		return
+	}
+	createClusterPolicyReport(c)
 }
 
 //newResult creates a new entry for Reports
-func newResult(FalcoPayload types.FalcoPayload) (c *clusterpolicyreport.PolicyReportResult, namespaceScoped bool) {
-	namespaceScoped = false // decision variable to increment for policyreport and clusterpolicyreport //to do //false for clusterpolicyreport
-	var m = make(map[string]string)
-	for index, element := range FalcoPayload.OutputFields {
-		if index == "ka.target.namespace" || index == "k8s.ns.name" {
-			namespaceScoped = true //true for policyreport
-		}
-		m[index] = fmt.Sprintf("%v", element)
-	}
-	const PolicyReportSource string = "Falco"
-	var pri string //initial hardcoded priority bounds
-	if FalcoPayload.Priority > types.PriorityType(failbound) {
-		if namespaceScoped == true {
-			polreport.Summary.Fail++
-		} else {
-			report.Summary.Fail++
-		}
-		pri = "high"
-	} else if FalcoPayload.Priority < types.PriorityType(failbound) {
-		if namespaceScoped == true {
-			polreport.Summary.Warn++
-		} else {
-			report.Summary.Warn++
-		}
-		pri = "low"
-	} else {
-		if namespaceScoped == true {
-			polreport.Summary.Warn++
-		} else {
-			report.Summary.Warn++
-		}
-		pri = "medium"
-	}
-	return &clusterpolicyreport.PolicyReportResult{
+func newResult(FalcoPayload types.FalcoPayload) (result *wgpolicy.PolicyReportResult, namespace string) {
+	namespace = ""
+
+	result = &wgpolicy.PolicyReportResult{
 		Policy:      FalcoPayload.Rule,
-		Source:      PolicyReportSource,
+		Source:      policyReportSource,
 		Scored:      false,
 		Timestamp:   metav1.Timestamp{Seconds: int64(FalcoPayload.Time.Second()), Nanos: int32(FalcoPayload.Time.Nanosecond())},
-		Severity:    v1alpha2.PolicyResultSeverity(pri),
 		Result:      "fail",
 		Description: FalcoPayload.Output,
-		Properties:  m,
-	}, namespaceScoped
+	}
+
+	var m = make(map[string]string)
+	for index, element := range FalcoPayload.OutputFields {
+		m[index] = fmt.Sprintf("%v", element)
+		if index == "ka.target.namespace" || index == "k8s.ns.name" {
+			namespace = fmt.Sprintf("%v", element)
+		}
+	}
+	result.Properties = m
+
+	prio := "medium"
+	if FalcoPayload.Priority > types.PriorityType(failbound) {
+		prio = "high"
+	}
+	if FalcoPayload.Priority < types.PriorityType(failbound) {
+		prio = "low"
+	}
+	result.Severity = wgpolicy.PolicyResultSeverity(prio)
+
+	switch {
+	case prio == "high" && namespace != "":
+		policyReport.Summary.Fail++
+	case prio == "high" && namespace == "":
+		clusterPolicyReport.Summary.Fail++
+	case prio != "high" && namespace != "":
+		policyReport.Summary.Fail++
+	case prio != "high" && namespace == "":
+		clusterPolicyReport.Summary.Fail++
+	}
+
+	return result, namespace
 }
-func checklow(result []*policyreport.PolicyReportResult) (swapint int) {
-	var i int
-	for i = 0; i < len(result); i++ {
-		if result[i].Severity == "medium" || result[i].Severity == "low" {
+
+func checklow(result []*wgpolicy.PolicyReportResult) (swapint int) {
+	for i, j := range result {
+		if j.Severity == "medium" || j.Severity == "low" {
 			return i
 		}
 	}
