@@ -1,5 +1,6 @@
 package outputs
 
+//thoomsa work
 import (
 	"context"
 	"fmt"
@@ -94,7 +95,8 @@ func (c *Client) CreateReport(falcopayload types.FalcoPayload) {
 			policyReport.ObjectMeta.Name = policyReportBaseName + uuid.NewString()
 		}
 	} else {
-		updateOrCreatePolicyReport(c, namespaceScoped)
+		fmt.Println("1")
+		updateOrCreateClusterPolicyReport(c)
 		if len(clusterPolicyReport.Results) >= failbound {
 			clusterPolicyReport.ObjectMeta.Name = clusterPolicyReportBaseName + uuid.NewString()
 		}
@@ -144,6 +146,7 @@ func updateOrCreatePolicyReport(c *Client, namespace string) {
 }
 
 func isClusterPolicyReportExist(c *Client) bool {
+	fmt.Println("3")
 	_, err := getClusterPolicyReport(c)
 	if !errors.IsNotFound(err) {
 		log.Printf("[Info]  : Policy Report %v doesn't exist\n", clusterPolicyReport.Name)
@@ -153,6 +156,7 @@ func isClusterPolicyReportExist(c *Client) bool {
 }
 
 func getClusterPolicyReport(c *Client) (*wgpolicy.ClusterPolicyReport, error) {
+	fmt.Println("4")
 	policyr := c.Crdclient.Wgpolicyk8sV1alpha2().ClusterPolicyReports()
 	return policyr.Get(context.Background(), clusterPolicyReport.Name, metav1.GetOptions{})
 }
@@ -178,10 +182,13 @@ func updateClusterPolicyReport(c *Client) {
 }
 
 func updateOrCreateClusterPolicyReport(c *Client) {
+	fmt.Println("2")
 	if isClusterPolicyReportExist(c) {
+		fmt.Println("5")
 		updateClusterPolicyReport(c)
 		return
 	}
+	fmt.Println("6")
 	createClusterPolicyReport(c)
 }
 
@@ -222,9 +229,9 @@ func newResult(FalcoPayload types.FalcoPayload) (result *wgpolicy.PolicyReportRe
 	case prio == "high" && namespace == "":
 		clusterPolicyReport.Summary.Fail++
 	case prio != "high" && namespace != "":
-		policyReport.Summary.Fail++
+		policyReport.Summary.Warn++
 	case prio != "high" && namespace == "":
-		clusterPolicyReport.Summary.Fail++
+		clusterPolicyReport.Summary.Warn++
 	}
 
 	return result, namespace
